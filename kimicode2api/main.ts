@@ -46,8 +46,6 @@ async function* streamProxyHandler(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
-        // 生产环境日志已被移除，使日志更清洁
         yield value;
       }
     } finally {
