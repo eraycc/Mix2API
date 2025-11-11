@@ -30,12 +30,11 @@ export DEFAULT_AUTHKEYS="sk-default,sk-your-key"
 # 调试模式 (可选，默认: true)
 export DEBUG="true"
 ```
-### 如何获取 Bearer Token？
-
-登录 [Kimi Chat](https://www.kimi.com/) 官网。
-打开浏览器开发者工具（通常是按 F12）。
-切换到 “应用程序” 标签页。
-找到cookie的kimi-auth值
+### 获取认证token
+- 登录 [Kimi Chat](https://www.kimi.com/) 官网。
+- 打开浏览器开发者工具（通常是按 F12）。
+- 切换到 “应用程序” 选项栏
+- 在cookie内找到kimi-auth值并复制
 
 
 ### 启动服务
