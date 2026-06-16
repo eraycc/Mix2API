@@ -2,17 +2,7 @@
 
 /**
  * MiMoCode Free API 代理 - 支持多种 API 格式
- * 
- * 支持端点：
- * - GET  /v1/models               (OpenAI 格式)
- * - POST /v1/chat/completions     (OpenAI Chat Completions 格式)
- * - POST /v1/responses            (OpenAI Responses 格式)
- * - POST /v1/messages             (Anthropic Messages 格式)
- * 
- * 功能：
- * - 流式 / 非流式响应
- * - 工具调用 (Function Calling)
- * - 推理内容 (reasoning_content) 支持
+ * 适配 Deno Deploy 边缘环境
  */
 
 // ============================================================
@@ -20,7 +10,7 @@
 // ============================================================
 
 const MIMO_BASE_URL = "https://api.xiaomimimo.com/api/free-ai";
-const JWT_CACHE_TTL = 50 * 60; // 50 秒（JWT 有效期约 60 分钟，提前刷新）
+const JWT_CACHE_TTL = 50 * 60; // 50 秒（提前刷新）
 
 // ============================================================
 // 类型定义
@@ -60,7 +50,6 @@ interface ChatCompletionRequest {
   tool_choice?: "auto" | "none" | { type: "function"; function: { name: string } };
   temperature?: number;
   max_tokens?: number;
-  [key: string]: unknown;
 }
 
 interface ResponsesRequest {
@@ -71,7 +60,6 @@ interface ResponsesRequest {
   tool_choice?: "auto" | "none" | { type: "function"; function: { name: string } };
   temperature?: number;
   max_output_tokens?: number;
-  [key: string]: unknown;
 }
 
 interface MessagesRequest {
@@ -82,14 +70,14 @@ interface MessagesRequest {
   tool_choice?: "auto" | "any" | { type: "function"; function: { name: string } };
   max_tokens: number;
   temperature?: number;
-  [key: string]: unknown;
+  system?: string;
 }
 
 // ============================================================
-// 设备指纹 & JWT 管理
+// 设备指纹（异步）
 // ============================================================
 
-function getDeviceFingerprint(): string {
+async function getDeviceFingerprint(): Promise<string> {
   const hostname = Deno.env.get("HOSTNAME") || "unknown";
   const os = Deno.build.os;
   const arch = Deno.build.arch;
@@ -98,13 +86,15 @@ function getDeviceFingerprint(): string {
   const raw = `${hostname}|${os}|${arch}|unknown|${username}`;
   const encoder = new TextEncoder();
   const data = encoder.encode(raw);
-  const hash = crypto.subtle.digestSync("SHA-256", data);
-  return Array.from(new Uint8Array(hash))
-    .map(b => b.toString(16).padStart(2, "0"))
-    .join("");
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// JWT 缓存
+// ============================================================
+// JWT 缓存（内存）
+// ============================================================
+
 let cachedJwt: string | null = null;
 let jwtExpiry: number = 0;
 
@@ -114,7 +104,7 @@ async function getJwt(): Promise<string> {
     return cachedJwt;
   }
   
-  const fingerprint = getDeviceFingerprint();
+  const fingerprint = await getDeviceFingerprint();
   const response = await fetch(`${MIMO_BASE_URL}/bootstrap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -128,7 +118,7 @@ async function getJwt(): Promise<string> {
   const data = await response.json();
   cachedJwt = data.jwt;
   
-  // 解析 JWT 过期时间（简化：假设 60 分钟）
+  // 解析 JWT 过期时间
   try {
     const parts = cachedJwt.split(".");
     if (parts.length === 3) {
@@ -168,7 +158,7 @@ function createErrorResponse(message: string, status: number = 400, type: string
     error: { message, type, param: null, code: status }
   }), {
     status,
-    headers: { "Content-Type": "application/json" }
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
   });
 }
 
@@ -230,22 +220,18 @@ async function callMimoAPI(
       content: "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks.",
     });
   } else {
-    // 检查系统消息是否包含必要标记
     const sysMsg = finalMessages.find(m => m.role === "system");
     if (sysMsg && sysMsg.content && !sysMsg.content.includes("MiMoCode")) {
-      // 追加标记
       sysMsg.content = `You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks.\n\n${sysMsg.content}`;
     }
   }
   
-  // 获取 JWT
   const jwt = await getJwt();
   const sessionId = getRandomSessionId();
   
-  // 构建请求体
   const requestBody: Record<string, unknown> = {
     model: "mimo-auto",
-    stream: true, // 始终使用流式，由代理决定是否聚合
+    stream: true, // 始终使用流式
     messages: finalMessages.map(m => ({
       role: m.role,
       content: m.content,
@@ -255,7 +241,6 @@ async function callMimoAPI(
     })),
   };
   
-  // 添加工具（如果提供）
   if (tools && tools.length > 0) {
     requestBody.tools = tools;
   }
@@ -263,7 +248,6 @@ async function callMimoAPI(
     requestBody.tool_choice = tool_choice;
   }
   
-  // 调用 MiMoCode API
   const response = await fetch(`${MIMO_BASE_URL}/openai/chat`, {
     method: "POST",
     headers: {
@@ -280,7 +264,6 @@ async function callMimoAPI(
     throw new Error(`MiMo API error: ${response.status} - ${errorText}`);
   }
   
-  // 处理响应
   if (stream) {
     return createStreamingResponse(transformMimoStreamToOpenAI(response, tools));
   } else {
@@ -295,7 +278,7 @@ async function callMimoAPI(
 
 function transformMimoStreamToOpenAI(
   response: Response,
-  tools?: Tool[]
+  _tools?: Tool[]
 ): ReadableStream {
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
@@ -311,7 +294,7 @@ function transformMimoStreamToOpenAI(
   
   let buffer = "";
   let hasSentRole = false;
-  let toolCalls: Map<string, { id: string; name: string; arguments: string }> = new Map();
+  const toolCalls: Map<string, { id: string; name: string; arguments: string }> = new Map();
   let currentToolCallId: string | null = null;
   
   return new ReadableStream({
@@ -352,7 +335,7 @@ function transformMimoStreamToOpenAI(
               
               const delta = choice.delta || {};
               
-              // 处理推理内容
+              // 推理内容
               if (delta.reasoning_content) {
                 const chunk = {
                   id: chatId,
@@ -368,7 +351,7 @@ function transformMimoStreamToOpenAI(
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
               
-              // 处理普通内容
+              // 普通内容
               if (delta.content) {
                 const chunk = {
                   id: chatId,
@@ -384,7 +367,7 @@ function transformMimoStreamToOpenAI(
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
               
-              // 处理工具调用
+              // 工具调用
               if (delta.tool_calls) {
                 for (const tc of delta.tool_calls) {
                   if (tc.id) {
@@ -406,9 +389,8 @@ function transformMimoStreamToOpenAI(
                 }
               }
               
-              // 处理结束
+              // 结束
               if (choice.finish_reason) {
-                // 如果有工具调用，发送工具调用 chunks
                 if (toolCalls.size > 0) {
                   for (const [, tc] of toolCalls) {
                     const toolChunk = {
@@ -435,7 +417,6 @@ function transformMimoStreamToOpenAI(
                   }
                 }
                 
-                // 发送结束 chunk
                 const finalChunk = {
                   id: chatId,
                   object: "chat.completion.chunk",
@@ -455,7 +436,6 @@ function transformMimoStreamToOpenAI(
           }
         }
         
-        // 发送 DONE
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       } catch (error) {
@@ -474,7 +454,7 @@ function transformMimoStreamToOpenAI(
 
 async function collectNonStreamResponse(
   response: Response,
-  tools?: Tool[]
+  _tools?: Tool[]
 ): Promise<Record<string, unknown>> {
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
@@ -543,7 +523,6 @@ async function collectNonStreamResponse(
     }
   }
   
-  // 构建 OpenAI 格式响应
   const message: Record<string, unknown> = {
     role: "assistant",
     content: fullContent || null,
@@ -583,26 +562,18 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   try {
     const body = await request.json() as ChatCompletionRequest;
     
-    // 验证模型
     if (body.model !== "mimo-auto") {
       return createErrorResponse(`Model "${body.model}" not supported. Only "mimo-auto" is available.`, 400);
     }
-    
-    // 验证消息
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
       return createErrorResponse("Messages are required", 400);
     }
     
-    // 提取工具
-    const tools = body.tools;
-    const toolChoice = body.tool_choice;
-    
-    // 调用 MiMo API
     return await callMimoAPI(
       body.messages,
       body.stream ?? false,
-      tools,
-      toolChoice
+      body.tools,
+      body.tool_choice
     );
   } catch (error) {
     if (error instanceof SyntaxError) {
@@ -620,12 +591,10 @@ async function handleResponses(request: Request): Promise<Response> {
   try {
     const body = await request.json() as ResponsesRequest;
     
-    // 验证模型
     if (body.model !== "mimo-auto") {
       return createErrorResponse(`Model "${body.model}" not supported. Only "mimo-auto" is available.`, 400);
     }
     
-    // 转换 input 为 messages
     let messages: Message[];
     if (typeof body.input === "string") {
       messages = [{ role: "user", content: body.input }];
@@ -635,16 +604,11 @@ async function handleResponses(request: Request): Promise<Response> {
       return createErrorResponse("Input must be a string or array of messages", 400);
     }
     
-    // 提取工具
-    const tools = body.tools;
-    const toolChoice = body.tool_choice;
-    
-    // 调用 MiMo API
     return await callMimoAPI(
       messages,
       body.stream ?? false,
-      tools,
-      toolChoice
+      body.tools,
+      body.tool_choice
     );
   } catch (error) {
     if (error instanceof SyntaxError) {
@@ -662,33 +626,21 @@ async function handleMessages(request: Request): Promise<Response> {
   try {
     const body = await request.json() as MessagesRequest;
     
-    // 验证模型
     if (body.model !== "mimo-auto") {
       return createErrorResponse(`Model "${body.model}" not supported. Only "mimo-auto" is available.`, 400);
     }
-    
-    // 验证消息
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
       return createErrorResponse("Messages are required", 400);
     }
-    
-    // 验证 max_tokens
     if (!body.max_tokens || body.max_tokens < 1) {
       return createErrorResponse("max_tokens is required and must be >= 1", 400);
     }
     
-    // Anthropic 格式转 OpenAI 格式
     const messages: Message[] = [];
-    
-    // 添加 system（如果有）
     if (body.system) {
       messages.push({ role: "system", content: body.system });
     }
-    
-    // 转换消息
     for (const msg of body.messages) {
-      // Anthropic 使用 "user" 和 "assistant"
-      // 也支持 "tool" 角色
       messages.push({
         role: msg.role === "tool" ? "tool" : msg.role,
         content: msg.content,
@@ -698,31 +650,24 @@ async function handleMessages(request: Request): Promise<Response> {
       });
     }
     
-    // 提取工具
-    const tools = body.tools;
-    // Anthropic tool_choice: "auto" | "any" | { type: "function"; function: { name: string } }
     let toolChoice = body.tool_choice;
     if (toolChoice === "any") {
-      // 近似转换为 OpenAI 的 "auto"
       toolChoice = "auto";
     }
     
-    // 调用 MiMo API
     const response = await callMimoAPI(
       messages,
       body.stream ?? false,
-      tools,
+      body.tools,
       toolChoice as any
     );
     
-    // 如果是非流式，需要将 OpenAI 格式转换为 Anthropic 格式
     if (!(body.stream ?? false)) {
       const data = await response.json();
       const anthropicResponse = convertOpenAIToAnthropic(data);
       return createJsonResponse(anthropicResponse);
     }
     
-    // 流式：需要转换 SSE 格式
     if (response.body) {
       const transformedStream = transformOpenAIStreamToAnthropic(response.body);
       return createStreamingResponse(transformedStream);
@@ -760,7 +705,6 @@ function convertOpenAIToAnthropic(openaiData: Record<string, unknown>): Record<s
     },
   };
   
-  // 处理内容
   if (message.content) {
     anthropicMessage.content.push({
       type: "text",
@@ -768,7 +712,6 @@ function convertOpenAIToAnthropic(openaiData: Record<string, unknown>): Record<s
     });
   }
   
-  // 处理工具调用
   if (message.tool_calls && Array.isArray(message.tool_calls)) {
     for (const tc of message.tool_calls) {
       anthropicMessage.content.push({
@@ -801,7 +744,6 @@ function transformOpenAIStreamToAnthropic(openAIStream: ReadableStream<Uint8Arra
   return new ReadableStream({
     async start(controller) {
       try {
-        // 发送 message_start 事件
         controller.enqueue(encoder.encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"${messageId}","type":"message","role":"assistant","content":[],"model":"${model}","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}\n\n`));
         
         while (true) {
@@ -824,67 +766,48 @@ function transformOpenAIStreamToAnthropic(openAIStream: ReadableStream<Uint8Arra
               
               const delta = choice.delta || {};
               
-              // 处理内容
               if (delta.content) {
                 fullContent += delta.content;
                 controller.enqueue(encoder.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${delta.content}"}}\n\n`));
               }
               
-              // 处理推理内容（Anthropic 没有直接对应，可以放在 text 中或忽略）
-              if (delta.reasoning_content) {
-                // 可选：作为特殊标记发送
-              }
-              
-              // 处理工具调用
               if (delta.tool_calls) {
                 for (const tc of delta.tool_calls) {
                   if (tc.id) {
-                    // 开始新的工具调用
                     if (currentToolId) {
-                      // 完成之前的工具调用
                       try {
-                        const input = JSON.parse(currentToolInput || "{}");
+                        JSON.parse(currentToolInput || "{}");
                         controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${toolUses.length}}\n\n`));
-                      } catch {
-                        // 忽略
-                      }
+                      } catch {}
                     }
                     currentToolId = tc.id;
                     currentToolName = "";
                     currentToolInput = "";
                     toolUses.push({ id: tc.id, name: "", input: "" });
                     
-                    // 发送 content_block_start
                     controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":${toolUses.length - 1},"content_block":{"type":"tool_use","id":"${tc.id}","name":"","input":{}}}\n\n`));
                   }
                   if (tc.function?.name) {
                     currentToolName = tc.function.name;
                     toolUses[toolUses.length - 1].name = currentToolName;
-                    // 更新 name
                     controller.enqueue(encoder.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":${toolUses.length - 1},"delta":{"type":"input_json_delta","partial_json":"{\\"name\\":\\"${currentToolName}\\""}}\n\n`));
                   }
                   if (tc.function?.arguments) {
                     currentToolInput += tc.function.arguments;
                     toolUses[toolUses.length - 1].input = currentToolInput;
-                    // 发送增量
                     controller.enqueue(encoder.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":${toolUses.length - 1},"delta":{"type":"input_json_delta","partial_json":"${tc.function.arguments}"}}\n\n`));
                   }
                 }
               }
               
-              // 处理结束
               if (choice.finish_reason) {
-                // 完成最后的工具调用
                 if (currentToolId) {
                   try {
-                    const input = JSON.parse(currentToolInput || "{}");
+                    JSON.parse(currentToolInput || "{}");
                     controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${toolUses.length - 1}}\n\n`));
-                  } catch {
-                    // 忽略
-                  }
+                  } catch {}
                 }
                 
-                // 发送 message_delta
                 const stopReason = choice.finish_reason === "stop" ? "end_turn" :
                                    choice.finish_reason === "tool_calls" ? "tool_use" : null;
                 controller.enqueue(encoder.encode(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"${stopReason}","stop_sequence":null},"usage":{"output_tokens":0}}\n\n`));
@@ -895,7 +818,6 @@ function transformOpenAIStreamToAnthropic(openAIStream: ReadableStream<Uint8Arra
           }
         }
         
-        // 发送 message_stop
         controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
         controller.close();
       } catch (error) {
@@ -932,7 +854,6 @@ function handleCORS(request: Request): Response | null {
 // ============================================================
 
 async function handler(request: Request): Promise<Response> {
-  // CORS 预检
   const corsResponse = handleCORS(request);
   if (corsResponse) return corsResponse;
   
@@ -941,27 +862,18 @@ async function handler(request: Request): Promise<Response> {
   const method = request.method;
   
   try {
-    // /v1/models
     if (path === "/v1/models" && method === "GET") {
       return getModelsList();
     }
-    
-    // /v1/chat/completions
     if (path === "/v1/chat/completions" && method === "POST") {
       return await handleChatCompletions(request);
     }
-    
-    // /v1/responses
     if (path === "/v1/responses" && method === "POST") {
       return await handleResponses(request);
     }
-    
-    // /v1/messages
     if (path === "/v1/messages" && method === "POST") {
       return await handleMessages(request);
     }
-    
-    // 健康检查
     if (path === "/health" || path === "/") {
       return createJsonResponse({
         status: "ok",
@@ -974,7 +886,6 @@ async function handler(request: Request): Promise<Response> {
         ],
       });
     }
-    
     return new Response("Not Found", { status: 404 });
   } catch (error) {
     console.error("Handler error:", error);
